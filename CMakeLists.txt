@@ -17,7 +17,7 @@ set(LLAMA_CPP_DIR "${CMAKE_SOURCE_DIR}/vendor/llama.cpp")
 # Only build the libraries we link against; skip tools, tests, server, examples
 set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_TOOLS    ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
 
@@ -49,7 +49,7 @@ target_compile_features(ohseeare PRIVATE cxx_std_17)
 # ohseeare-gui ImGui GUI with built-in screen capture
 add_executable(ohseeare-gui
     src/ohseeare-gui.cpp
-    src/tinyfiledialogs.c
+    vendor/tinyfiledialogs.c
     vendor/glad.c
     vendor/imgui/imgui.cpp
     vendor/imgui/imgui_draw.cpp
