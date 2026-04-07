@@ -9,4 +9,7 @@ else
     echo "Downloading GLM-OCR-f16.gguf..."
     wget -O GLM-OCR-f16.gguf https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/GLM-OCR-f16.gguf
     echo "Download completed."
+    echo "Downloading mmproj-GLM-OCR-Q8_0.gguf..."
+    wget -O mmproj-GLM-OCR-Q8_0.gguf "https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main/mmproj-GLM-OCR-Q8_0.gguf"
+    echo "Download completed."
 fi

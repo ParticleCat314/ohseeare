@@ -31,9 +31,6 @@ compile_commands.json
 install_manifest.txt
 CTestTestfile.cmake
 
-# ImGui (downloaded by scripts/download-imgui.sh)
-imgui/
-
 # Models (user-provided)
 models/
 

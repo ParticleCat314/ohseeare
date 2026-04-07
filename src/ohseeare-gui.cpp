@@ -7,14 +7,21 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+#include "Inter-Medium.h"
+#include "JetBrainsMono-Regular.h"
+
 #ifdef __linux__
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
 #endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
+#include <iostream>
 #include <atomic>
 #include <chrono>
 #include <clocale>
@@ -40,10 +47,10 @@
 
 // Default model paths set by CMake
 #ifndef OHSEEARE_MODEL
-#define OHSEEARE_MODEL "models/glm-ocr/glm-ocr.gguf"
+#define OHSEEARE_MODEL "models/GLM-OCR-f16.gguf"
 #endif
 #ifndef OHSEEARE_MMPROJ
-#define OHSEEARE_MMPROJ "models/glm-ocr/mmproj-glm-ocr.gguf"
+#define OHSEEARE_MMPROJ "models/mmproj-GLM-OCR-Q8_0.gguf"
 #endif
 
 // Global flags and stuff
@@ -395,11 +402,10 @@ struct AppSettings {
 
 static bool load_settings(AppSettings &s) {
   namespace fs = std::filesystem;
-  const char *xdg = std::getenv("XDG_CONFIG_HOME");
-  fs::path cfg = xdg ? fs::path(xdg) / "ohseeare" / "settings.conf"
-                     : fs::path(std::getenv("HOME")) / ".config" / "ohseeare" /
-                           "settings.conf";
-  FILE *f = fopen(cfg.c_str(), "r");
+
+  // Load from where the executable is. Relative path
+
+  FILE *f = fopen("./settings.conf", "r");
   if (!f)
     return false;
   char line[1024];
@@ -448,14 +454,13 @@ static bool load_settings(AppSettings &s) {
 
 static void save_settings(const AppSettings &s) {
   namespace fs = std::filesystem;
-  const char *xdg = std::getenv("XDG_CONFIG_HOME");
-  fs::path dir = xdg ? fs::path(xdg) / "ohseeare"
-                     : fs::path(std::getenv("HOME")) / ".config" / "ohseeare";
+  fs::path dir = fs::path("settings.conf");
   std::error_code ec;
   fs::create_directories(dir, ec);
+
   if (ec)
     return;
-  FILE *f = fopen((dir / "settings.conf").c_str(), "w");
+  FILE *f = fopen("./settings.conf", "w");
   if (!f)
     return;
   fprintf(f,
@@ -495,6 +500,30 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Detach from the launching terminal so the shell prompt returns immediately.
+  // We fork (parent exits → shell gets its prompt back) but deliberately skip
+  // setsid() so the child stays in the original X11 login session — required
+  // for XGrabKey to keep working. SIGHUP is ignored so the child survives
+  // terminal closure.
+#ifdef __linux__
+  {
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid > 0) return 0; // parent: exit, returning the prompt to the shell
+    // child: redirect stdio to /dev/null and survive terminal hangup
+    signal(SIGHUP, SIG_IGN);
+    int fd = open("/dev/null", O_RDWR);
+    if (fd >= 0) {
+      dup2(fd, STDIN_FILENO);
+      dup2(fd, STDOUT_FILENO);
+      dup2(fd, STDERR_FILENO);
+      close(fd);
+    }
+  }
+#elif defined(_WIN32)
+  FreeConsole();
+#endif
+
   std::setlocale(LC_NUMERIC, "C");
   ggml_time_init();
   common_init();
@@ -505,7 +534,7 @@ int main(int argc, char **argv) {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-  glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);      // start hidden
+  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);      // start hidden
   glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);      // always on top
   glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_TRUE); // grab focus when shown
   glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
@@ -536,21 +565,14 @@ int main(int argc, char **argv) {
   ImGuiIO &io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-  // Load fonts fall back to the built-in default if the files aren't found.
-#ifndef OHSEEARE_FONTS_DIR
-#define OHSEEARE_FONTS_DIR ""
-#endif
+  // Load fonts from embedded byte arrays.
   ImFont *font_mono = nullptr;
   {
-    const std::string fonts_dir = OHSEEARE_FONTS_DIR;
-    const std::string ui_path = fonts_dir + "/Inter-Medium.ttf";
-    const std::string mono_path = fonts_dir + "/JetBrainsMono-Regular.ttf";
+    ImFontConfig cfg;
+    cfg.FontDataOwnedByAtlas = false; // static arrays, don't free them
 
-    if (std::filesystem::exists(ui_path))
-      io.Fonts->AddFontFromFileTTF(ui_path.c_str(), 15.0f);
-
-    if (std::filesystem::exists(mono_path))
-      font_mono = io.Fonts->AddFontFromFileTTF(mono_path.c_str(), 14.0f);
+    io.Fonts->AddFontFromMemoryTTF(Inter_Medium_ttf, (int)Inter_Medium_ttf_len, 15.0f, &cfg);
+    font_mono = io.Fonts->AddFontFromMemoryTTF(JetBrainsMono_Regular_ttf, (int)JetBrainsMono_Regular_ttf_len, 14.0f, &cfg);
 
     io.Fonts->Build();
   }
@@ -614,8 +636,8 @@ int main(int argc, char **argv) {
                   "  Press Ctrl+Shift+S to capture a screen region.\n"
                   "\n");
 
-  while (!app_quit_requested.load()) {
 
+  while (!app_quit_requested.load()) {
     // When hidden, sleep efficiently; when visible, poll normally.
     if (window_visible) {
       glfwPollEvents();

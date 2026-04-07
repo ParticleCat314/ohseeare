@@ -1,3 +1,6 @@
-[submodule "tiny-sco"]
-	path = tiny-sco
-	url = https://github.com/ParticleCat314/tiny-sco/
+[submodule "vendor/glfw"]
+	path = vendor/glfw
+	url = https://github.com/glfw/glfw.git
+[submodule "vendor/llama.cpp"]
+	path = vendor/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
