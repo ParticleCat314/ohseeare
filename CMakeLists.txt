@@ -38,14 +38,6 @@ set(OHSEEARE_MODEL_PATH  "${CMAKE_SOURCE_DIR}/models/GLM-OCR-f16.gguf"
 set(OHSEEARE_MMPROJ_PATH "${CMAKE_SOURCE_DIR}/models/mmproj-GLM-OCR-Q8_0.gguf"
     CACHE FILEPATH "Path to the ohseeare vision-projector GGUF")
 
-# ohseeare CLI OCR binary (links against llama.cpp)
-add_executable(ohseeare src/ohseeare.cpp)
-target_include_directories(ohseeare PRIVATE
-    ${LLAMA_CPP_DIR}/include
-    ${LLAMA_CPP_DIR}/common)
-target_link_libraries(ohseeare PRIVATE common mtmd Threads::Threads)
-target_compile_features(ohseeare PRIVATE cxx_std_17)
-
 # ohseeare-gui ImGui GUI with built-in screen capture
 add_executable(ohseeare-gui
     src/ohseeare-gui.cpp

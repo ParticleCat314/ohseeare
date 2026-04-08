@@ -2,7 +2,7 @@
 
 Screen-region OCR via [llama.cpp](https://github.com/ggml-org/llama.cpp). 
 I got sick of typing out LaTeX snippets and tables so I made this small tool. It has a lot of problems but 
-gets the job done. Use GLM-OCR for best results.
+gets the job done. Use [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR/tree/main) as the model for best results. The GGUF format is available [here](https://huggingface.co/ggml-org/GLM-OCR-GGUF).
 
 It's worth noting that there are several other tools out there that do 
 basically the same thing, and those tools are far more mature and polished.
