@@ -3,10 +3,10 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
-#include "style.h" // Custom window styling
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "style.h" // Custom window styling
 
 #include "Inter-Medium.h"
 #include "JetBrainsMono-Regular.h"
@@ -22,27 +22,18 @@
 #include <windows.h>
 #endif
 
-#include <iostream>
 #include <atomic>
 #include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-// llama.cpp headers
-#include "chat.h"
 #include "common.h"
-#include "llama.h"
-#include "log.h"
-#include "mtmd-helper.h"
-#include "mtmd.h"
-#include "sampling.h"
-
+#include "ocr_engine.h"
 #include "sco.h"
 #include "tinyfiledialogs.h"
 
@@ -54,13 +45,14 @@
 #define OHSEEARE_MMPROJ "models/mmproj-GLM-OCR-Q8_0.gguf"
 #endif
 
-// Global flags and stuff
+#define INITIAL_PROMPT "Latexify"
+
 static std::atomic<bool> capture_requested{false};
 static std::atomic<bool> window_hide_requested{false};
 static std::atomic<bool> app_quit_requested{false};
 
 // Global hotkey listener  (Linux: Ctrl+Shift+S via XGrabKey)
-// Should be configurable eventually 
+// Should be configurable eventually
 
 static void start_hotkey_listener(std::atomic<bool> *flag) {
 #ifdef __linux__
@@ -105,184 +97,13 @@ static void start_hotkey_listener(std::atomic<bool> *flag) {
   (void)flag;
 #endif
 }
-
-// Persistent model context - loaded once, reused for every query
-struct OcrEngine {
-  std::unique_ptr<common_init_result> llama_init;
-  llama_model *model = nullptr;
-  llama_context *lctx = nullptr;
-  const llama_vocab *vocab = nullptr;
-  mtmd::context_ptr ctx_vision{nullptr};
-  std::unique_ptr<common_chat_templates, decltype(&common_chat_templates_free)>
-      tmpls{nullptr, common_chat_templates_free};
-  bool ok = false;
-
-  // Load model + vision projector.  Call once at startup.
-  bool load(const char *model_path, const char *mmproj_path,
-            int n_threads = 8) {
-    // Silence library log spam
-    common_log_set_verbosity_thold(-1);
-    llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
-    mtmd_helper_log_set([](enum ggml_log_level, const char *, void *) {},
-                        nullptr);
-
-    common_params params;
-    params.model.path = model_path;
-    params.mmproj.path = mmproj_path;
-    params.n_predict = 1024;
-    params.n_ctx = 2048;
-    params.n_batch = 1024;
-    params.n_ubatch = 512;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    params.cpuparams.n_threads = n_threads;
-    params.verbosity = -1;
-    params.sampling.temp = 0.1f;
-
-    llama_init = common_init_from_params(params);
-    if (!llama_init)
-      return false;
-
-    model = llama_init->model();
-    lctx = llama_init->context();
-    vocab = llama_model_get_vocab(model);
-    if (!model || !lctx || !vocab)
-      return false;
-
-    mtmd_context_params mparams = mtmd_context_params_default();
-    mparams.use_gpu = true;
-    mparams.print_timings = false;
-    mparams.n_threads = params.cpuparams.n_threads;
-    ctx_vision.reset(mtmd_init_from_file(mmproj_path, model, mparams));
-    if (!ctx_vision)
-      return false;
-
-    tmpls.reset(common_chat_templates_init(model, "").release());
-
-    ok = true;
-    return true;
-  }
-
-  // Free all resources so a new model can be loaded.
-  void free() {
-    ok = false;
-    ctx_vision.reset();
-    tmpls.reset(nullptr);
-    llama_init.reset(); // frees model + context
-    model = nullptr;
-    lctx = nullptr;
-    vocab = nullptr;
-  }
-
-  // Run inference on an image file. Can be called repeatedly without reloading.
-  std::string infer(const char *image_path, const char *prompt_text,
-                    float temperature = 0.1f, int max_tokens = 2048) {
-    if (!ok)
-      return "(model not loaded)";
-    mtmd::bitmaps bitmaps;
-    {
-      mtmd::bitmap bmp(
-          mtmd_helper_bitmap_init_from_file(ctx_vision.get(), image_path));
-      if (!bmp.ptr)
-        return "(failed to load image)";
-      bitmaps.entries.push_back(std::move(bmp));
-    }
-    return infer_impl(bitmaps, prompt_text, temperature, max_tokens);
-  }
-
-  // Run inference on raw RGBA pixels (e.g. from sco_capture_region).
-  // Strips the alpha channel before passing to the model (which expects RGB).
-  std::string infer(const uint8_t *rgba, int width, int height,
-                    const char *prompt_text,
-                    float temperature = 0.1f, int max_tokens = 2048) {
-    if (!ok)
-      return "(model not loaded)";
-    std::vector<uint8_t> rgb((size_t)width * height * 3);
-    for (int i = 0; i < width * height; i++) {
-      rgb[i * 3]     = rgba[i * 4];
-      rgb[i * 3 + 1] = rgba[i * 4 + 1];
-      rgb[i * 3 + 2] = rgba[i * 4 + 2];
-    }
-    mtmd::bitmaps bitmaps;
-    {
-      mtmd::bitmap bmp(mtmd_bitmap_init(width, height, rgb.data()));
-      if (!bmp.ptr)
-        return "(failed to create bitmap)";
-      bitmaps.entries.push_back(std::move(bmp));
-    }
-    return infer_impl(bitmaps, prompt_text, temperature, max_tokens);
-  }
-
-private:
-  std::string infer_impl(mtmd::bitmaps &bitmaps, const char *prompt_text,
-                         float temperature, int max_tokens) {
-    // Build the prompt with image marker
-    std::string prompt = std::string(mtmd_default_marker()) + prompt_text;
-
-    // Format via the model's chat template
-    std::vector<common_chat_msg> history;
-    common_chat_msg user_msg{"user", prompt, {}};
-    auto formatted =
-        common_chat_format_single(tmpls.get(), history, user_msg, true, false);
-
-    // Tokenize text + image
-    mtmd_input_text inp{formatted.c_str(), true, true};
-    mtmd::input_chunks chunks(mtmd_input_chunks_init());
-    auto bitmaps_ptr = bitmaps.c_ptr();
-    if (mtmd_tokenize(ctx_vision.get(), chunks.ptr.get(), &inp,
-                      bitmaps_ptr.data(), bitmaps_ptr.size()) != 0)
-      return "(tokenization failed)";
-
-    // Clear KV cache so each query starts fresh
-    llama_memory_clear(llama_get_memory(lctx), true);
-
-    // Eval prompt
-    llama_pos n_past = 0;
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    if (mtmd_helper_eval_chunks(ctx_vision.get(), lctx, chunks.ptr.get(),
-                                n_past, 0, 1024, true, &n_past)) {
-      llama_batch_free(batch);
-      return "(eval failed)";
-    }
-
-    // Sample / generate
-    common_params_sampling sparams;
-    sparams.temp = temperature;
-    auto *smpl = common_sampler_init(model, sparams);
-
-    std::string out;
-    for (int i = 0; i < max_tokens; i++) {
-      llama_token token = common_sampler_sample(smpl, lctx, -1);
-      common_sampler_accept(smpl, token, true);
-
-      if (llama_vocab_is_eog(vocab, token))
-        break;
-
-      out += common_token_to_piece(lctx, token);
-
-      common_batch_clear(batch);
-      common_batch_add(batch, token, n_past++, {0}, true);
-      if (llama_decode(lctx, batch))
-        break;
-    }
-
-    common_sampler_free(smpl);
-    llama_batch_free(batch);
-
-    // Strip trailing whitespace
-    while (!out.empty() &&
-           (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
-      out.pop_back();
-    return out;
-  }
-};
-
 // Helpers
 static const char *format_elapsed(double seconds, char *buf, size_t len) {
-  if (seconds < 1.0)
+  if (seconds < 1.0) {
     snprintf(buf, len, "%.0f ms", seconds * 1000.0);
-  else if (seconds < 60.0)
+  } else if (seconds < 60.0) {
     snprintf(buf, len, "%.2f s", seconds);
-  else {
+  } else {
     int m = (int)(seconds / 60.0);
     double s = seconds - m * 60.0;
     snprintf(buf, len, "%dm %.1fs", m, s);
@@ -292,11 +113,13 @@ static const char *format_elapsed(double seconds, char *buf, size_t len) {
 
 static void center_window_on_primary(GLFWwindow *w) {
   GLFWmonitor *mon = glfwGetPrimaryMonitor();
-  if (!mon)
+  if (!mon) {
     return;
+  }
   const GLFWvidmode *mode = glfwGetVideoMode(mon);
-  if (!mode)
+  if (!mode) {
     return;
+  }
   int ww, wh;
   glfwGetWindowSize(w, &ww, &wh);
   int mx, my;
@@ -305,86 +128,14 @@ static void center_window_on_primary(GLFWwindow *w) {
                    my + (mode->height - wh) / 2);
 }
 
-// Settings persistence
 struct AppSettings {
-  std::string model_path;
-  std::string mmproj_path;
+  std::string model_path = OHSEEARE_MODEL;
+  std::string mmproj_path = OHSEEARE_MMPROJ;
   float temperature = 0.1f;
   int max_tokens = 2048;
   int n_threads = 8;
   bool auto_copy = false;
 };
-
-static bool load_settings(AppSettings &s) {
-  namespace fs = std::filesystem;
-
-  // Load from where the executable is. Relative path
-
-  FILE *f = fopen("./settings.conf", "r");
-  if (!f)
-    return false;
-  char line[1024];
-  bool found = false;
-  while (fgets(line, sizeof(line), f)) {
-    std::string str(line);
-    if (!str.empty() && str.back() == '\n')
-      str.pop_back();
-    auto eq = str.find('=');
-    if (eq == std::string::npos)
-      continue;
-    std::string key = str.substr(0, eq), val = str.substr(eq + 1);
-    if (key == "model_path") {
-      s.model_path = val;
-      found = true;
-    }
-    if (key == "mmproj_path") {
-      s.mmproj_path = val;
-      found = true;
-    }
-    if (key == "temperature") {
-      try {
-        s.temperature = std::stof(val);
-      } catch (...) {
-      }
-    }
-    if (key == "max_tokens") {
-      try {
-        s.max_tokens = std::stoi(val);
-      } catch (...) {
-      }
-    }
-    if (key == "n_threads") {
-      try {
-        s.n_threads = std::stoi(val);
-      } catch (...) {
-      }
-    }
-    if (key == "auto_copy") {
-      s.auto_copy = (val == "1");
-    }
-  }
-  fclose(f);
-  return found;
-}
-
-static void save_settings(const AppSettings &s) {
-  namespace fs = std::filesystem;
-  fs::path dir = fs::path("settings.conf");
-  std::error_code ec;
-  fs::create_directories(dir, ec);
-
-  if (ec)
-    return;
-  FILE *f = fopen("./settings.conf", "w");
-  if (!f)
-    return;
-  fprintf(f,
-          "model_path=%s\nmmproj_path=%s\ntemperature=%.4f\nmax_tokens=%d\nn_"
-          "threads=%d\nauto_copy=%d\n",
-          s.model_path.c_str(), s.mmproj_path.c_str(), s.temperature,
-          s.max_tokens, s.n_threads, s.auto_copy ? 1 : 0);
-  fclose(f);
-}
 
 // GLFW close callback hide the popup instead of quitting
 static void close_callback(GLFWwindow *w) {
@@ -392,39 +143,38 @@ static void close_callback(GLFWwindow *w) {
   window_hide_requested.store(true);
 }
 
-// Main
 int main(int argc, char **argv) {
   AppSettings cfg;
   cfg.model_path = OHSEEARE_MODEL;
   cfg.mmproj_path = OHSEEARE_MMPROJ;
-  load_settings(cfg);
-  // Keep local refs for backward-compat with argv parsing below
+
   std::string &model_path_str = cfg.model_path;
   std::string &mmproj_path_str = cfg.mmproj_path;
 
   for (int i = 1; i < argc; i++) {
     if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) &&
-        i + 1 < argc)
+        i + 1 < argc) {
       model_path_str = argv[++i];
-    else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc)
+    } else if (strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) {
       mmproj_path_str = argv[++i];
-    else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       fprintf(stderr,
               "Usage: ohseeare-gui [-m model.gguf] [--mmproj mmproj.gguf]\n");
       return 0;
     }
   }
 
-  // Detach from the launching terminal so the shell prompt returns immediately.
-  // We fork (parent exits → shell gets its prompt back) but deliberately skip
-  // setsid() so the child stays in the original X11 login session — required
-  // for XGrabKey to keep working. SIGHUP is ignored so the child survives
-  // terminal closure.
 #ifdef __linux__
   {
     pid_t pid = fork();
-    if (pid < 0) { perror("fork"); return 1; }
-    if (pid > 0) return 0; // parent: exit, returning the prompt to the shell
+    if (pid < 0) {
+      perror("fork");
+      return 1;
+    }
+    if (pid > 0) {
+      return 0; // parent: exit, returning the prompt to the shell
+    }
+
     // child: redirect stdio to /dev/null and survive terminal hangup
     signal(SIGHUP, SIG_IGN);
     int fd = open("/dev/null", O_RDWR);
@@ -443,8 +193,9 @@ int main(int argc, char **argv) {
   ggml_time_init();
   common_init();
 
-  if (!glfwInit())
+  if (!glfwInit()) {
     return 1;
+  }
 
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -453,12 +204,7 @@ int main(int argc, char **argv) {
   glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);      // always on top
   glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_TRUE); // grab focus when shown
   glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-  // Make the window floating above all windows
-  glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
-  // Hack to get floating windows on i3
   glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
-  // Set the window position to mouse cursor position (will be recentered on capture)
   glfwWindowHint(GLFW_DECORATED, GLFW_FALSE); // no title bar, borders, etc.
 
   GLFWwindow *window = glfwCreateWindow(560, 460, "ohseeare", nullptr, nullptr);
@@ -480,14 +226,18 @@ int main(int argc, char **argv) {
   ImGuiIO &io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-  // Load fonts from embedded byte arrays.
+  // Load fonts from embedded byte arrays because I don't want to depend on more
+  // junk
   ImFont *font_mono = nullptr;
   {
     ImFontConfig cfg;
     cfg.FontDataOwnedByAtlas = false; // static arrays, don't free them
 
-    io.Fonts->AddFontFromMemoryTTF(Inter_Medium_ttf, (int)Inter_Medium_ttf_len, 15.0f, &cfg);
-    font_mono = io.Fonts->AddFontFromMemoryTTF(JetBrainsMono_Regular_ttf, (int)JetBrainsMono_Regular_ttf_len, 14.0f, &cfg);
+    io.Fonts->AddFontFromMemoryTTF(Inter_Medium_ttf, (int)Inter_Medium_ttf_len,
+                                   15.0f, &cfg);
+    font_mono = io.Fonts->AddFontFromMemoryTTF(
+        JetBrainsMono_Regular_ttf, (int)JetBrainsMono_Regular_ttf_len, 14.0f,
+        &cfg);
 
     io.Fonts->Build();
   }
@@ -497,7 +247,7 @@ int main(int argc, char **argv) {
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init("#version 330");
 
-  static char prompt[512] = "Latexify";
+  static char prompt[512] = INITIAL_PROMPT;
 
   OcrEngine engine;
   fprintf(stderr, "\n  Loading model: %s\n  Loading mmproj: %s\n",
@@ -551,7 +301,6 @@ int main(int argc, char **argv) {
                   "  Press Ctrl+Shift+S to capture a screen region.\n"
                   "\n");
 
-
   while (!app_quit_requested.load()) {
     // When hidden, sleep efficiently; when visible, poll normally.
     if (window_visible) {
@@ -584,8 +333,9 @@ int main(int argc, char **argv) {
         window_visible = false;
       }
       // Let the compositor/WM finish hiding
-      for (int i = 0; i < 3; i++)
+      for (int i = 0; i < 3; i++) {
         glfwPollEvents();
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
       ScoImage cap = sco_capture_region();
@@ -598,8 +348,9 @@ int main(int argc, char **argv) {
         glfwFocusWindow(window);
         window_visible = true;
 
-        if (ocr_thread.joinable())
+        if (ocr_thread.joinable()) {
           ocr_thread.join();
+        }
 
         ocr_running.store(true);
         timer_start = Clock::now();
@@ -620,9 +371,8 @@ int main(int argc, char **argv) {
                                   &ocr_running, &last_elapsed_sec,
                                   &timer_active, &timer_start,
                                   &auto_copy_pending, prompt_copy,
-                                  cap_ptr = last_cap,
-                                  infer_temp, infer_max_tokens,
-                                  infer_auto_copy] {
+                                  cap_ptr = last_cap, infer_temp,
+                                  infer_max_tokens, infer_auto_copy] {
           std::string text = engine.infer(cap_ptr->rgba.data(), cap_ptr->width,
                                           cap_ptr->height, prompt_copy.c_str(),
                                           infer_temp, infer_max_tokens);
@@ -660,8 +410,9 @@ int main(int argc, char **argv) {
 
     // Handle rerun request
     if (rerun_requested.exchange(false) && !ocr_running.load() && last_cap) {
-      if (ocr_thread.joinable())
+      if (ocr_thread.joinable()) {
         ocr_thread.join();
+      }
 
       ocr_running.store(true);
       timer_start = Clock::now();
@@ -678,15 +429,13 @@ int main(int argc, char **argv) {
       bool infer_auto_copy = settings_auto_copy;
 
       ocr_thread = std::thread([&engine, &result, &status, &result_mutex,
-                                &ocr_running, &last_elapsed_sec,
-                                &timer_active, &timer_start,
-                                &auto_copy_pending, prompt_copy,
-                                cap_ptr = last_cap,
-                                infer_temp, infer_max_tokens,
-                                infer_auto_copy] {
-        std::string text = engine.infer(cap_ptr->rgba.data(), cap_ptr->width,
-                                        cap_ptr->height, prompt_copy.c_str(),
-                                        infer_temp, infer_max_tokens);
+                                &ocr_running, &last_elapsed_sec, &timer_active,
+                                &timer_start, &auto_copy_pending, prompt_copy,
+                                cap_ptr = last_cap, infer_temp,
+                                infer_max_tokens, infer_auto_copy] {
+        std::string text =
+            engine.infer(cap_ptr->rgba.data(), cap_ptr->width, cap_ptr->height,
+                         prompt_copy.c_str(), infer_temp, infer_max_tokens);
 
         double elapsed =
             std::chrono::duration<double>(Clock::now() - timer_start).count();
@@ -701,8 +450,9 @@ int main(int argc, char **argv) {
           format_elapsed(elapsed, tbuf, sizeof(tbuf));
           status = std::string("Done in ") + tbuf;
         }
-        if (infer_auto_copy)
+        if (infer_auto_copy) {
           auto_copy_pending.store(true);
+        }
         ocr_running.store(false);
       });
     }
@@ -740,7 +490,6 @@ int main(int argc, char **argv) {
               mmproj_path_str = new_mmproj;
               cfg.n_threads = new_n_threads;
               model_reload_status = "Model reloaded successfully.";
-              save_settings(cfg);
             } else {
               model_reload_status = "ERROR: failed to load model. Check paths.";
             }
@@ -749,8 +498,9 @@ int main(int argc, char **argv) {
     }
 
     // Skip rendering when hidden
-    if (!window_visible)
+    if (!window_visible) {
       continue;
+    }
 
     // Render
     int fb_w, fb_h;
@@ -810,7 +560,6 @@ int main(int argc, char **argv) {
             cfg.temperature = settings_temperature;
             cfg.max_tokens = settings_max_tokens;
             cfg.auto_copy = settings_auto_copy;
-            save_settings(cfg);
           }
         }
         ImGui::PopStyleColor(3);
@@ -860,8 +609,9 @@ int main(int argc, char **argv) {
       ImGui::Spacing();
 
       bool reloading = model_reloading.load();
-      if (reloading)
+      if (reloading) {
         ImGui::BeginDisabled();
+      }
 
       ImGui::TextDisabled("MODEL  \xe2\x80\x94  changes require reload");
       ImGui::Spacing();
@@ -900,8 +650,9 @@ int main(int argc, char **argv) {
         const char *r = tinyfd_openFileDialog("Select mmproj File",
                                               settings_mmproj_path.c_str(), 1,
                                               filters, "GGUF mmproj files", 0);
-        if (r)
+        if (r) {
           settings_mmproj_path = r;
+        }
       }
       ImGui::Spacing();
 
@@ -921,31 +672,40 @@ int main(int argc, char **argv) {
       bool model_changed = (settings_model_path != model_path_str ||
                             settings_mmproj_path != mmproj_path_str ||
                             settings_n_threads != cfg.n_threads);
-      if (!model_changed)
+
+      if (!model_changed) {
         ImGui::BeginDisabled();
+      }
+
       ImGui::PushStyleColor(ImGuiCol_Button,
                             ImVec4(0.345f, 0.525f, 0.976f, 1.f));
       ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
                             ImVec4(0.435f, 0.600f, 1.000f, 1.f));
       ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                             ImVec4(0.265f, 0.440f, 0.890f, 1.f));
-      if (ImGui::Button(reloading ? "Reloading..." : "Reload Model", {120, 0}))
+
+      if (ImGui::Button(reloading ? "Reloading..." : "Reload Model",
+                        {120, 0})) {
         model_reload_requested.store(true);
+      }
       ImGui::PopStyleColor(3);
-      if (!model_changed)
+      if (!model_changed) {
         ImGui::EndDisabled();
+      }
 
       ImGui::SameLine();
       {
         std::lock_guard<std::mutex> lock(result_mutex);
-        if (reloading)
+        if (reloading) {
           ImGui::TextDisabled("Loading model, please wait...");
-        else if (!model_reload_status.empty())
+        } else if (!model_reload_status.empty()) {
           ImGui::TextDisabled("%s", model_reload_status.c_str());
+        }
       }
 
-      if (reloading)
+      if (reloading) {
         ImGui::EndDisabled();
+      }
 
       ImGui::Spacing();
       ImGui::Separator();
@@ -988,7 +748,6 @@ int main(int argc, char **argv) {
         cfg.auto_copy = settings_auto_copy;
         cfg.temperature = settings_temperature;
         cfg.max_tokens = settings_max_tokens;
-        save_settings(cfg);
       }
 
       ImGui::EndChild();
@@ -1009,15 +768,18 @@ int main(int argc, char **argv) {
       ImGui::PushStyleColor(ImGuiCol_ButtonActive, btn_act);
       ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
 
-      if (running)
+      if (running) {
         ImGui::BeginDisabled();
+      }
       if (ImGui::Button(
               running ? "  Processing\xe2\x80\xa6  "
                       : "  \xf0\x9f\x93\xb7  Capture Region  (Ctrl+Shift+S)  ",
-              {-1, 36}))
+              {-1, 36})) {
         capture_requested.store(true);
-      if (running)
+      }
+      if (running) {
         ImGui::EndDisabled();
+      }
 
       ImGui::PopStyleColor(4);
     }
@@ -1047,8 +809,10 @@ int main(int argc, char **argv) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float status_bar_h = ImGui::GetFrameHeightWithSpacing() + 8.f;
     float text_h = avail.y - status_bar_h;
-    if (text_h < 60.f)
+
+    if (text_h < 60.f) {
       text_h = 60.f;
+    }
 
     // Copy result into a stable local buffer under the lock
     std::vector<char> result_buf;
@@ -1060,12 +824,16 @@ int main(int argc, char **argv) {
 
     ImGui::PushStyleColor(ImGuiCol_FrameBg,
                           ImVec4(0.118f, 0.122f, 0.145f, 1.f));
-    if (font_mono)
+    if (font_mono) {
       ImGui::PushFont(font_mono);
+    }
+
     ImGui::InputTextMultiline("##result", result_buf.data(), result_buf.size(),
                               {-1, text_h}, ImGuiInputTextFlags_ReadOnly);
-    if (font_mono)
+    if (font_mono) {
       ImGui::PopFont();
+    }
+
     ImGui::PopStyleColor();
 
     // Status bar
@@ -1095,12 +863,17 @@ int main(int argc, char **argv) {
       ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                             ImVec4(0.265f, 0.440f, 0.890f, 1.f));
       bool can_rerun = !running && last_cap != nullptr;
-      if (!can_rerun)
+
+      if (!can_rerun) {
         ImGui::BeginDisabled();
-      if (ImGui::Button("\xe2\x86\xba  Rerun", {80, 0}))
+      }
+      if (ImGui::Button("\xe2\x86\xba  Rerun", {80, 0})) {
         rerun_requested.store(true);
-      if (!can_rerun)
+      }
+      if (!can_rerun) {
         ImGui::EndDisabled();
+      }
+
       ImGui::PopStyleColor(3);
 
       ImGui::SameLine();
@@ -1139,10 +912,12 @@ int main(int argc, char **argv) {
   }
 
   // Cleanup
-  if (ocr_thread.joinable())
+  if (ocr_thread.joinable()) {
     ocr_thread.join();
-  if (reload_thread.joinable())
+  }
+  if (reload_thread.joinable()) {
     reload_thread.join();
+  }
 
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();

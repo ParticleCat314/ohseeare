@@ -1,10 +1,10 @@
 #pragma once
 #include "imgui.h"
+// Ignore this it has no effect on the actual OCR stuff
 
 static void apply_custom_style() {
   ImGuiStyle &s = ImGui::GetStyle();
 
-  // Geometry
   s.WindowPadding = ImVec2(20, 16);
   s.FramePadding = ImVec2(15, 6);
   s.ItemSpacing = ImVec2(10, 8);
@@ -12,7 +12,6 @@ static void apply_custom_style() {
   s.ScrollbarSize = 12.f;
   s.GrabMinSize = 10.f;
 
-  // Rounding
   s.WindowRounding = 5.f;
   s.FrameRounding = 6.f;
   s.GrabRounding = 4.f;
@@ -21,12 +20,10 @@ static void apply_custom_style() {
   s.ChildRounding = 6.f;
   s.PopupRounding = 6.f;
 
-  // Borders
   s.WindowBorderSize = 3.f;
   s.FrameBorderSize = 0.f;
   s.PopupBorderSize = 1.f;
 
-  // Colours - slate-blue dark theme
   ImVec4 *c = s.Colors;
 
   const ImVec4 bg = ImVec4(0.098f, 0.102f, 0.122f, 1.00f);
@@ -88,4 +85,3 @@ static void apply_custom_style() {
   c[ImGuiCol_TextSelectedBg] = ImVec4(accent.x, accent.y, accent.z, 0.35f);
   c[ImGuiCol_NavHighlight] = accent;
 }
-
